@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli", "scanner", "curator", "stager", "exif_fixer", "importer", "state", "models"]
+
+[project]
+name = "takeout2icloud"
+version = "1.0.0"
+description = "Import Google Takeout Photos into macOS Photos.app via iCloud"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+    "osxphotos>=0.68",
+]
+
+[project.scripts]
+takeout2icloud = "cli:main"
