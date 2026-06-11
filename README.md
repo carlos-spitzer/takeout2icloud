@@ -43,6 +43,10 @@ takeout2icloud curate
 takeout2icloud stage
 takeout2icloud fix-exif
 takeout2icloud import
+
+# After import, verify and sync album assignments
+takeout2icloud sync-albums --dry-run   # audit only
+takeout2icloud sync-albums             # apply corrections
 ```
 
 ## Commands
@@ -51,11 +55,13 @@ takeout2icloud import
 |---------|-------------|
 | `scan <path>` | Walk Takeout directory, parse sidecars, build SQLite DB |
 | `curate` | Deduplicate album vs year-bucket copies |
-| `stage` | Copy pending files to `~/.takeout2icloud/staging/` |
+| `stage` | Copy pending files to `~/.takeout2icloud/staging/` with album-prefixed filenames |
 | `fix-exif` | Write JSON sidecar metadata into file EXIF tags |
-| `import` | Import into Photos.app with album assignments |
+| `import` | Import into Photos.app one-by-one via osascript with duplicate prevention |
 | `run <path>` | Run all five phases in sequence (resumable) |
 | `retry` | Reset failed files so they can be reprocessed |
+| `repair-uuids` | Fix invalid photo UUIDs in the state DB by cross-referencing Photos.app |
+| `sync-albums` | Verify and correct iCloud album memberships against Google Takeout |
 | `status` | Show current progress |
 
 ## Import flags
@@ -69,8 +75,9 @@ takeout2icloud import
 ### 1. Scan
 
 Walks the Takeout tree, matches each media file to its `.json` sidecar
-(both new `.supplemental-metadata.json` and legacy formats), computes
-SHA256 hashes, and stores everything in `~/.takeout2icloud/state.db`.
+(both new `.supplemental-metadata.json` and legacy formats, including
+double-dot variants), computes SHA256 hashes, and stores everything in
+`~/.takeout2icloud/state.db`.
 
 ### 2. Curate
 
@@ -80,7 +87,8 @@ named album folder. Unique unalbumized photos are kept.
 ### 3. Stage
 
 Copies files to a flat staging directory (`~/.takeout2icloud/staging/`).
-Handles filename collisions. Originals are never modified.
+Filenames are prefixed with the album name (`AlbumName__photo.jpg`) to
+prevent cross-album collisions. Originals are never modified.
 
 ### 4. Fix EXIF
 
@@ -91,24 +99,24 @@ Also detects and fixes mismatched file extensions (e.g. JPEG saved as
 
 ### 5. Import
 
-Uses `photoscript` (from `osxphotos`) to drive Photos.app via Apple
-Events. Creates albums and assigns photos to them.
+Uses direct `osascript` (AppleScript) calls to drive Photos.app. Imports
+one file at a time with:
 
-**Dialog dismisser**: Photos.app sometimes shows error dialogs
-("No se pueden importar N items") that block the Apple Events bridge.
-A companion bash script (`dismiss_dialogs.sh`) runs as a **separate OS
-process** to auto-dismiss these dialogs, avoiding the Apple Events
-deadlock that occurs with background threads.
+- **Duplicate prevention**: builds an in-memory filename index from
+  Photos.app before importing; skips files that already exist
+- **Ghost import detection**: when osascript returns an error but
+  Photos.app silently imported the file, detects it via filename search
+- **Auto-restart**: after 20 consecutive failures, quits and relaunches
+  Photos.app to recover from its periodic broken state
+- **Album assignment**: creates albums on demand and assigns each photo
+  to its correct album(s)
 
-**Multi-pass strategy**: When Photos.app shows an error dialog mid-batch,
-`import_photos()` returns an empty list. Rather than marking those files
-as failed, this tool leaves them as `exif_fixed` so a subsequent run
-retries them. Only files that are explicitly unmatched in a
-partially-successful batch get marked as genuinely rejected.
+### 6. Sync albums (post-import)
 
-The `DISMISS_DELAY` environment variable (default: 1 second) controls how
-long the dismisser waits after detecting a dialog before closing it,
-giving `import_photos()` time to read the result.
+Compares expected album memberships (from the state DB) against actual
+albums in Photos.app, then adds missing photos and removes extras.
+Includes a UUID repair step for photos whose DB UUID doesn't match
+Photos.app.
 
 ## Known edge cases
 
@@ -124,15 +132,18 @@ giving `import_photos()` time to read the result.
 - **Extension mismatches**: Google sometimes saves JPEGs as `.HEIC` or
   PNGs as `.jpg`. The fix-exif phase detects and renames these using the
   `file` command.
+- **Photos.app crashes**: after ~2,500 consecutive imports, Photos.app
+  enters a broken state. The importer auto-restarts it and continues.
+- **Unicode normalization**: album names may differ between NFD and NFC
+  forms; the sync module handles both.
 
 ## State and logs
 
 | Path | Purpose |
 |------|---------|
 | `~/.takeout2icloud/state.db` | SQLite database tracking all file states |
-| `~/.takeout2icloud/staging/` | Flat directory with staged copies |
+| `~/.takeout2icloud/staging/` | Flat directory with staged copies (can be deleted after import) |
 | `~/.takeout2icloud/errors.log` | Error log from all phases |
-| `~/.takeout2icloud/dismiss.log` | Log of auto-dismissed Photos.app dialogs |
 
 The process is fully resumable. Re-running any command skips files that
 have already progressed past that phase.
