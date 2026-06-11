@@ -43,12 +43,14 @@ def stage() -> int:
                 progress.advance(task)
                 continue
 
-            dest_name = src.name
+            album = row.get("album_name") or "unalbumized"
+            safe_album = album.replace("/", "_").replace(" ", "_")
+            dest_name = f"{safe_album}__{src.name}"
             if dest_name in used_names:
                 used_names[dest_name] += 1
                 stem = src.stem
                 ext = src.suffix
-                dest_name = f"{stem}_{used_names[dest_name]}{ext}"
+                dest_name = f"{safe_album}__{stem}_{used_names[dest_name]}{ext}"
             else:
                 used_names[dest_name] = 0
 

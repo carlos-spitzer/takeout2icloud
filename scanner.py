@@ -61,8 +61,8 @@ def find_sidecar(media_path: Path) -> Path | None:
             return candidate
 
     # Also try glob for unpredictable truncation lengths
-    # e.g. "photo.jpg.supplement.json", "photo.jpg.suppl.json"
-    pattern = f"{name}.supplement*json"
+    # e.g. "photo.jpg.supplemental-metadata.json", "photo.jpg.supp.json"
+    pattern = f"{name}.supp*json"
     matches = list(parent.glob(pattern))
     if matches:
         return matches[0]
@@ -70,6 +70,11 @@ def find_sidecar(media_path: Path) -> Path | None:
     # --- Legacy Takeout format: .json suffix ---
     # 1. Exact match: photo.jpg -> photo.jpg.json
     candidate = parent / f"{name}.json"
+    if candidate.exists():
+        return candidate
+
+    # 1b. Double-dot variant: photo.jpg..json
+    candidate = parent / f"{name}..json"
     if candidate.exists():
         return candidate
 

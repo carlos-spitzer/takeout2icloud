@@ -1,20 +1,12 @@
 """Phase 5: Import EXIF-fixed files into macOS Photos.app.
 
-Uses photoscript (osxphotos) to drive Photos.app via Apple Events.
-A separate bash process (dismiss_dialogs.sh) auto-dismisses error dialogs
-to avoid the Apple Events deadlock that occurs when a background thread
-tries to interact with Photos.app while an import call is in progress.
-
-When Photos.app shows an error dialog mid-batch, import_photos() returns
-an empty list. Rather than marking those files as failed, this module
-leaves them as exif_fixed so a subsequent run can retry them. Only files
-that are explicitly unmatched in a partially-successful batch are marked
-as genuinely rejected.
+Uses AppleScript (osascript) directly to drive Photos.app.
+Imports one file at a time with timeout-based dialog dismissal.
+Pre-checks for duplicates using an in-memory filename index.
+Fully unattended.
 """
 
 import logging
-import os
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -28,124 +20,219 @@ from state import get_connection, get_media_by_status, get_album_memberships, up
 logger = logging.getLogger(__name__)
 console = Console()
 
-BATCH_SIZE = 10
-
-# Path to the standalone dismiss script (runs as separate OS process)
-_DISMISS_SCRIPT = Path(__file__).parent / "dismiss_dialogs.sh"
-_DISMISS_LOG = Path.home() / ".takeout2icloud" / "dismiss.log"
-
-
-def check_photoscript() -> None:
-    """Verify that photoscript (from osxphotos) is installed."""
-    try:
-        import photoscript  # noqa: F401
-    except ImportError:
-        console.print("[red]photoscript not found.[/red]")
-        console.print("Install it with: [bold]pip install osxphotos[/bold]")
-        raise SystemExit(1)
+IMPORT_TIMEOUT = 20
+COMMIT_INTERVAL = 50
 
 
 def check_photos_running() -> bool:
-    """Return True if Photos.app is currently running."""
     result = subprocess.run(["pgrep", "-x", "Photos"], capture_output=True)
     return result.returncode == 0
 
 
 def _validate_file(filepath: Path) -> bool:
-    """Return True if the file exists and is non-empty."""
     return filepath.exists() and filepath.stat().st_size > 0
 
 
-class DialogDismisser:
-    """Launches dismiss_dialogs.sh as a separate OS process.
+def _dismiss_dialog() -> bool:
+    script = '''
+    tell application "System Events"
+        tell process "Photos"
+            if exists sheet 1 of window 1 then
+                try
+                    set btns to name of every button of sheet 1 of window 1
+                    if btns contains "Aceptar" then
+                        click button "Aceptar" of sheet 1 of window 1
+                    else if btns contains "No importar" then
+                        click button "No importar" of sheet 1 of window 1
+                    else if btns contains "OK" then
+                        click button "OK" of sheet 1 of window 1
+                    else
+                        keystroke return
+                    end if
+                    return "dismissed"
+                on error
+                    return "error"
+                end try
+            end if
+        end tell
+    end tell
+    '''
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=10,
+    )
+    return "dismissed" in result.stdout
 
-    This avoids the Apple Events deadlock that occurs when a background
-    THREAD tries to send osascript commands while the main thread's
-    import_photos() call is waiting for Photos.app to respond.
 
-    A separate PROCESS has its own Apple Events connection, so it can
-    interact with System Events independently.
-    """
+def _build_photos_filename_index() -> dict[str, str]:
+    """Build filename -> UUID map from Photos.app for duplicate detection."""
+    console.print("[dim]Building Photos.app filename index for duplicate detection...[/dim]")
+    script = '''
+    tell application "Photos"
+        set ids to id of every media item
+        set fns to filename of every media item
+        set output to ""
+        repeat with i from 1 to count of ids
+            set output to output & (item i of ids) & "|" & (item i of fns) & linefeed
+        end repeat
+        return output
+    end tell
+    '''
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=300,
+    )
+    fn_to_uuid: dict[str, str] = {}
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if "|" not in line:
+            continue
+        raw_id, fn = line.split("|", 1)
+        uuid = raw_id.split("/")[0] if "/" in raw_id else raw_id
+        fn_to_uuid[fn] = uuid
+    console.print(f"[dim]Indexed {len(fn_to_uuid)} items in Photos.app[/dim]")
+    return fn_to_uuid
 
-    def __init__(self):
-        self._proc: Optional[subprocess.Popen] = None
 
-    def start(self):
-        _DISMISS_LOG.parent.mkdir(parents=True, exist_ok=True)
-        _DISMISS_LOG.write_text("")
-
-        self._proc = subprocess.Popen(
-            [str(_DISMISS_SCRIPT)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,
+def _osascript_import(filepath: str) -> Optional[str]:
+    escaped = filepath.replace('"', '\\"')
+    script = f'''
+    tell application "Photos"
+        set theFile to POSIX file "{escaped}"
+        set imported to import {{theFile}} skip check duplicates yes
+        if (count of imported) > 0 then
+            return id of item 1 of imported
+        else
+            return "EMPTY"
+        end if
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=IMPORT_TIMEOUT,
         )
-        logger.info("Dialog dismisser started (PID %d)", self._proc.pid)
-
-    def stop(self):
-        if self._proc and self._proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                self._proc.wait(timeout=5)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            logger.info("Dialog dismisser stopped")
-
-    @property
-    def total_dismissed(self) -> int:
-        """Count dismissed dialogs by reading the log file."""
-        try:
-            if _DISMISS_LOG.exists():
-                return sum(1 for line in _DISMISS_LOG.read_text().splitlines() if line.strip())
-        except Exception:
-            pass
-        return 0
+        stdout = result.stdout.strip()
+        if result.returncode == 0 and stdout and stdout != "EMPTY":
+            uuid = stdout.split("/")[0] if "/" in stdout else stdout
+            return uuid
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("Import timed out for %s", filepath)
+        _dismiss_dialog()
+        time.sleep(1)
+        _dismiss_dialog()
+        return None
+    except Exception as e:
+        logger.error("Import error for %s: %s", filepath, e)
+        return None
 
 
-def _assign_albums(photo, sha256: str, conn, album_cache: dict, photos_lib) -> None:
-    """Add a photo to all albums it belongs to, creating albums as needed."""
+def _assign_albums_osascript(uuid: str, sha256: str, conn, album_cache: dict) -> None:
     albums = get_album_memberships(conn, sha256)
     for album_name in albums:
         try:
+            escaped_album = album_name.replace('"', '\\"')
             if album_name not in album_cache:
-                existing = photos_lib.album(album_name)
-                album_cache[album_name] = existing if existing else photos_lib.create_album(album_name)
-            album_cache[album_name].add([photo])
+                script = f'''
+                tell application "Photos"
+                    try
+                        set theAlbum to first album whose name is "{escaped_album}"
+                    on error
+                        set theAlbum to make new album named "{escaped_album}"
+                    end try
+                    return name of theAlbum
+                end tell
+                '''
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=15,
+                )
+                album_cache[album_name] = True
+
+            script = f'''
+            tell application "Photos"
+                set theAlbum to first album whose name is "{escaped_album}"
+                set thePhoto to media item id "{uuid}"
+                add {{thePhoto}} to theAlbum
+            end tell
+            '''
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=15,
+            )
         except Exception as e:
             logger.error("Album add failed '%s': %s", album_name, e)
 
 
-def _match_imported_photos(imported, batch_rows, rows_by_basename, conn, album_cache, photos_lib):
-    """Match returned Photo objects to DB rows by filename. Returns set of matched source_paths."""
-    matched_sources: set[str] = set()
+def _import_one(row, conn, album_cache, photos_index: dict[str, str],
+                max_retries: int = 2) -> bool:
+    path = row["canonical_path"]
+    staged_fn = Path(path).name
 
-    for photo in imported:
-        try:
-            photo_fn = photo.filename
-        except Exception:
-            continue
+    # Pre-check: if this filename already exists in Photos.app, skip import
+    # and just record the existing UUID
+    if staged_fn in photos_index:
+        uuid = photos_index[staged_fn]
+        _assign_albums_osascript(uuid, row["sha256"], conn, album_cache)
+        update_status(conn, row["sha256"], row["source_path"], "imported", photos_uuid=uuid)
+        return True
 
-        matching_rows = rows_by_basename.get(photo_fn, [])
-        if not matching_rows:
-            # Fallback: match by stem (Photos.app may change extension)
-            photo_stem = Path(photo_fn).stem
-            for basename, rows_list in rows_by_basename.items():
-                if Path(basename).stem == photo_stem:
-                    matching_rows = rows_list
-                    break
+    for attempt in range(max_retries):
+        _dismiss_dialog()
 
-        for row in matching_rows:
-            if row["source_path"] in matched_sources:
-                continue
-            matched_sources.add(row["source_path"])
-            _assign_albums(photo, row["sha256"], conn, album_cache, photos_lib)
-            update_status(conn, row["sha256"], row["source_path"], "imported", photos_uuid=photo.uuid)
-            break
+        uuid = _osascript_import(path)
 
-    return matched_sources
+        if not uuid:
+            time.sleep(1)
+            if _dismiss_dialog():
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                return False
+
+            # No dialog; check if Photos.app imported it silently (ghost import)
+            # Re-query by filename to catch it
+            escaped = staged_fn.replace('"', '\\"')
+            check_script = f'''
+            tell application "Photos"
+                set found to search for "{escaped}"
+                if (count of found) > 0 then
+                    return id of item 1 of found
+                else
+                    return "NOT_FOUND"
+                end if
+            end tell
+            '''
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", check_script],
+                    capture_output=True, text=True, timeout=15,
+                )
+                stdout = result.stdout.strip()
+                if result.returncode == 0 and stdout and stdout != "NOT_FOUND":
+                    uuid = stdout.split("/")[0] if "/" in stdout else stdout
+            except Exception:
+                pass
+
+        if uuid:
+            photos_index[staged_fn] = uuid
+            _assign_albums_osascript(uuid, row["sha256"], conn, album_cache)
+            update_status(conn, row["sha256"], row["source_path"], "imported", photos_uuid=uuid)
+            return True
+
+        if attempt < max_retries - 1:
+            time.sleep(2)
+
+    return False
+
+
+def _restart_photos() -> None:
+    console.print("  [yellow]Restarting Photos.app...[/yellow]")
+    subprocess.run(["osascript", "-e", 'tell application "Photos" to quit'], capture_output=True, timeout=10)
+    time.sleep(5)
+    subprocess.run(["open", "-a", "Photos"], capture_output=True)
+    time.sleep(10)
 
 
 def import_photos(
@@ -153,12 +240,6 @@ def import_photos(
     dry_run: bool = False,
     album: Optional[str] = None,
 ) -> int:
-    """Import EXIF-fixed files into Photos.app.
-
-    Returns the number of files successfully imported.
-    """
-    check_photoscript()
-
     if not dry_run and not check_photos_running():
         console.print("[red]Photos.app is not running.[/red]")
         console.print("Please open Photos.app before importing.")
@@ -191,131 +272,71 @@ def import_photos(
         conn.close()
         return 0
 
-    import photoscript
-
-    photos_lib = photoscript.PhotosLibrary()
-
-    # Verify Apple Events authorization
-    try:
-        photos_lib.albums()
-    except Exception as e:
-        err = str(e)
-        if "-1743" in err or "not authorized" in err.lower():
-            console.print("[red]Apple Events authorization required.[/red]")
-            console.print(
-                "macOS is blocking this process from controlling Photos.app.\n"
-                "Grant access in System Settings > Privacy > Automation."
-            )
-            raise SystemExit(1)
-        raise
-
-    # Start background dialog dismisser
-    dismisser = DialogDismisser()
-    dismisser.start()
-    console.print("[dim]Background dialog dismisser started[/dim]")
+    # Build filename index for duplicate prevention
+    photos_index = _build_photos_filename_index()
 
     album_cache: dict = {}
     imported_count = 0
+    skipped_count = 0
     failed_count = 0
-    deferred_count = 0
+    consecutive_failures = 0
     total_files = len(files)
-    total_batches = (total_files + BATCH_SIZE - 1) // BATCH_SIZE
-    consecutive_empty = 0
 
     console.print(
-        f"Importing [bold]{total_files}[/bold] files in "
-        f"[bold]{total_batches}[/bold] batches of {BATCH_SIZE}"
+        f"Importing [bold]{total_files}[/bold] files one-by-one via osascript "
+        f"(timeout: {IMPORT_TIMEOUT}s, 2 retries per file)"
     )
 
     with Progress(console=console) as progress:
         task = progress.add_task("Importing to Photos.app...", total=total_files)
 
-        for batch_start in range(0, total_files, BATCH_SIZE):
-            batch = files[batch_start:batch_start + BATCH_SIZE]
-
-            # Validate paths
-            batch_rows: list[dict] = []
-            for row in batch:
-                if _validate_file(Path(row["canonical_path"])):
-                    batch_rows.append(row)
-                else:
-                    update_status(conn, row["sha256"], row["source_path"],
-                                  "failed", error_message="File missing or empty")
-                    failed_count += 1
-                    progress.advance(task)
-
-            if not batch_rows:
+        for i, row in enumerate(files):
+            if not _validate_file(Path(row["canonical_path"])):
+                update_status(conn, row["sha256"], row["source_path"],
+                              "failed", error_message="File missing or empty")
+                failed_count += 1
+                progress.advance(task)
                 continue
 
-            batch_paths = [r["canonical_path"] for r in batch_rows]
-            rows_by_basename: dict[str, list[dict]] = {}
-            for row in batch_rows:
-                basename = Path(row["canonical_path"]).name
-                rows_by_basename.setdefault(basename, []).append(row)
+            staged_fn = Path(row["canonical_path"]).name
+            already_exists = staged_fn in photos_index
 
-            try:
-                imported = photos_lib.import_photos(batch_paths, skip_duplicate_check=True)
-                time.sleep(0.5)
+            if _import_one(row, conn, album_cache, photos_index):
+                imported_count += 1
+                consecutive_failures = 0
+                if already_exists:
+                    skipped_count += 1
+            else:
+                update_status(conn, row["sha256"], row["source_path"],
+                              "failed", error_message="Rejected by Photos.app")
+                failed_count += 1
+                consecutive_failures += 1
 
-                matched_sources = _match_imported_photos(
-                    imported, batch_rows, rows_by_basename, conn, album_cache, photos_lib,
-                )
-                imported_count += len(matched_sources)
+            progress.advance(task)
 
-                # Handle unmatched files
-                unmatched = [r for r in batch_rows if r["source_path"] not in matched_sources]
-                if unmatched and len(imported) == 0:
-                    # Entire batch returned empty: dialog likely blocked the result.
-                    # Leave as exif_fixed for retry.
-                    consecutive_empty += 1
-                    deferred_count += len(unmatched)
-                    if consecutive_empty >= 5:
-                        console.print("[yellow]Multiple empty batches, waiting for Photos.app...[/yellow]")
-                        time.sleep(10)
-                        consecutive_empty = 0
-                else:
-                    consecutive_empty = 0
-                    for row in unmatched:
-                        update_status(conn, row["sha256"], row["source_path"],
-                                      "failed", error_message="Rejected by Photos.app (confirmed)")
-                        failed_count += 1
+            if (i + 1) % COMMIT_INTERVAL == 0:
+                conn.commit()
 
-                progress.advance(task, len(batch_rows))
-
-            except Exception as e:
-                logger.error("Batch import error: %s", e)
-                # Leave as exif_fixed for retry
-                deferred_count += len(batch_rows)
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    time.sleep(15)
-                    consecutive_empty = 0
-                progress.advance(task, len(batch_rows))
-
-            conn.commit()
-
-            batch_idx = batch_start // BATCH_SIZE
-            if (batch_idx + 1) % 100 == 0:
+            if (i + 1) % 500 == 0:
                 console.print(
-                    f"  [dim]Progress: {imported_count} imported, "
-                    f"{failed_count} failed, {deferred_count} deferred, "
-                    f"{total_files - imported_count - failed_count - deferred_count} remaining "
-                    f"(dialogs dismissed: {dismisser.total_dismissed})[/dim]"
+                    f"  [dim]Progress: {imported_count} imported"
+                    f"{f' ({skipped_count} already existed)' if skipped_count else ''}, "
+                    f"{failed_count} failed ({i + 1}/{total_files})[/dim]"
                 )
 
-    dismisser.stop()
+            if consecutive_failures >= 20:
+                console.print(f"  [yellow]{consecutive_failures} consecutive failures, restarting Photos.app[/yellow]")
+                _restart_photos()
+                consecutive_failures = 0
+
+    conn.commit()
     conn.close()
 
     console.print(f"\n[bold green]Import complete[/bold green]")
     console.print(f"  Imported: {imported_count}")
-    if deferred_count:
-        console.print(f"  Deferred (retry needed): {deferred_count}")
+    if skipped_count:
+        console.print(f"  Already existed (deduped): {skipped_count}")
     if failed_count:
         console.print(f"  Failed/rejected: {failed_count}")
-    console.print(f"  Dialogs auto-dismissed: {dismisser.total_dismissed}")
-
-    if deferred_count:
-        console.print("\n[yellow]Some files were deferred due to Photos.app dialogs.[/yellow]")
-        console.print("Run [bold]takeout2icloud import[/bold] again to retry them.")
 
     return imported_count
