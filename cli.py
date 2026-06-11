@@ -180,6 +180,33 @@ def retry(phase):
         console.print("[yellow]No matching failed files found for that phase.[/yellow]")
 
 
+@cli.command("repair-uuids")
+@click.option("--dry-run", is_flag=True, help="Show what would be repaired without changing the DB.")
+def repair_uuids_cmd(dry_run):
+    """Repair invalid photo UUIDs in the state DB.
+
+    Some photos were imported with incorrect UUIDs due to filename collisions
+    during batch matching. This command cross-references Photos.app to find
+    the correct UUIDs and updates the DB.
+    """
+    from album_sync import repair_uuids
+    repair_uuids(dry_run=dry_run)
+
+
+@cli.command("sync-albums")
+@click.option("--dry-run", is_flag=True, help="Audit only, don't make changes.")
+@click.option("--album", type=str, default=None, help="Filter albums by name (substring match).")
+@click.option("--skip-removals", is_flag=True, help="Only add missing photos, don't remove extras.")
+def sync_albums_cmd(dry_run, album, skip_removals):
+    """Sync iCloud album memberships to match Google Takeout.
+
+    Compares expected assignments (from the state DB) against actual albums
+    in Photos.app, then adds missing photos and removes extras.
+    """
+    from album_sync import sync_albums
+    sync_albums(album_filter=album, dry_run=dry_run, skip_removals=skip_removals)
+
+
 @cli.command()
 def status():
     """Show current import progress."""
